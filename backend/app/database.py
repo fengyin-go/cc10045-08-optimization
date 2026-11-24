@@ -90,6 +90,9 @@ DDL_STATEMENTS = [
         baseline_value REAL,
         comparison_status TEXT DEFAULT '已保存',
         z_score REAL,
+        round_id INTEGER,
+        round_key TEXT,
+        data_source TEXT DEFAULT 'metric_store',
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (metric_id) REFERENCES metrics(id)
     )""",
@@ -252,9 +255,90 @@ DDL_STATEMENTS = [
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         report_id INTEGER NOT NULL,
         output_content TEXT NOT NULL DEFAULT '{}',
+        section_id INTEGER,
+        round_id INTEGER,
+        generation_key TEXT,
         generated_at TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (report_id) REFERENCES reports(id)
     )""",
+
+    # ==================== Report Round / Data Section Tier ====================
+    # 一轮指标计算：报告的多项指标要么全部来自同一轮，要么整体回退到上一完整轮，
+    # 避免出现「收入新值 + 退款旧值」的撕裂截面。
+    """CREATE TABLE IF NOT EXISTS report_rounds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        round_key TEXT NOT NULL UNIQUE,
+        report_id INTEGER,
+        required_metric_ids TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT '计算中',
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT,
+        cutoff_at TEXT,
+        note TEXT DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (report_id) REFERENCES reports(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_report_rounds_report ON report_rounds(report_id, id)",
+
+    # 报告数据截面：一次报告生成/留档实际读到的那一份数据，逐指标记录来源行。
+    # 截面一经确认即不可改写；后续重算只会产生新轮次/新截面。
+    """CREATE TABLE IF NOT EXISTS report_sections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        section_key TEXT NOT NULL UNIQUE,
+        report_id INTEGER NOT NULL,
+        round_id INTEGER,
+        round_key TEXT,
+        cutoff_metric_value_id INTEGER,
+        cutoff_at TEXT,
+        status TEXT NOT NULL DEFAULT '已确认',
+        is_complete INTEGER NOT NULL DEFAULT 0,
+        is_consistent INTEGER NOT NULL DEFAULT 0,
+        waited_for_round INTEGER NOT NULL DEFAULT 0,
+        pending_round_id INTEGER,
+        pending_round_status TEXT,
+        data_mode TEXT NOT NULL DEFAULT '',
+        source_summary TEXT NOT NULL DEFAULT '[]',
+        section_content TEXT NOT NULL DEFAULT '{}',
+        note TEXT DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (report_id) REFERENCES reports(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_report_sections_report ON report_sections(report_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_report_sections_round ON report_sections(report_id, round_id)",
+
+    """CREATE TABLE IF NOT EXISTS report_section_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        section_id INTEGER NOT NULL,
+        metric_id INTEGER NOT NULL,
+        metric_name TEXT NOT NULL,
+        metric_type TEXT DEFAULT '',
+        unit TEXT DEFAULT '',
+        position INTEGER NOT NULL DEFAULT 0,
+        value REAL,
+        baseline_value REAL,
+        comparison_status TEXT,
+        metric_value_id INTEGER,
+        source_time TEXT,
+        round_id INTEGER,
+        round_key TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (section_id) REFERENCES report_sections(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_report_section_items_section ON report_section_items(section_id, position)",
+
+    # 每次留档对比的不可变结果，重算不会覆盖历史差异。
+    """CREATE TABLE IF NOT EXISTS snapshot_comparisons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_a_id INTEGER NOT NULL,
+        snapshot_b_id INTEGER NOT NULL,
+        same_source INTEGER NOT NULL DEFAULT 0,
+        has_difference INTEGER NOT NULL DEFAULT 0,
+        result_content TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (snapshot_a_id) REFERENCES snapshots(id),
+        FOREIGN KEY (snapshot_b_id) REFERENCES snapshots(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_snapshot_comparisons_pair ON snapshot_comparisons(snapshot_a_id, snapshot_b_id)",
 
     # ==================== Operational Tier ====================
     """CREATE TABLE IF NOT EXISTS alerts (
@@ -317,6 +401,10 @@ DDL_STATEMENTS = [
         report_id INTEGER,
         snapshot_content TEXT NOT NULL DEFAULT '{}',
         comparison_diff TEXT,
+        section_id INTEGER,
+        round_id INTEGER,
+        generation_key TEXT,
+        source_summary TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL DEFAULT '已保存',
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
@@ -355,6 +443,27 @@ DDL_STATEMENTS = [
     )""",
 ]
 
+# 增量列迁移：旧库上 CREATE TABLE IF NOT EXISTS 不会补列，逐列补齐后再建索引。
+COLUMN_MIGRATIONS = [
+    ("metric_values", "round_id", "INTEGER"),
+    ("metric_values", "round_key", "TEXT"),
+    ("metric_values", "data_source", "TEXT DEFAULT 'metric_store'"),
+    ("report_outputs", "section_id", "INTEGER"),
+    ("report_outputs", "round_id", "INTEGER"),
+    ("report_outputs", "generation_key", "TEXT"),
+    ("snapshots", "section_id", "INTEGER"),
+    ("snapshots", "round_id", "INTEGER"),
+    ("snapshots", "generation_key", "TEXT"),
+    ("snapshots", "source_summary", "TEXT NOT NULL DEFAULT '[]'"),
+]
+
+POST_MIGRATION_DDL = [
+    "CREATE INDEX IF NOT EXISTS idx_mv_round ON metric_values(round_id, metric_id)",
+    "CREATE INDEX IF NOT EXISTS idx_report_outputs_section ON report_outputs(section_id)",
+    "CREATE INDEX IF NOT EXISTS idx_report_outputs_generation ON report_outputs(generation_key)",
+    "CREATE INDEX IF NOT EXISTS idx_snapshots_section ON snapshots(section_id)",
+]
+
 
 class AnalyticsDB:
     """SQLite-backed analytics database with connection pooling and WAL mode."""
@@ -372,6 +481,12 @@ class AnalyticsDB:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
         for stmt in DDL_STATEMENTS:
+            conn.execute(stmt)
+        for table, column, decl in COLUMN_MIGRATIONS:
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        for stmt in POST_MIGRATION_DDL:
             conn.execute(stmt)
         conn.commit()
         conn.close()

@@ -90,13 +90,18 @@ class BaseModuleService:
             return None, missing
 
         table = self._module_table()
+        columns = {
+            row["name"] for row in db.fetchall(f"PRAGMA table_info({table})")
+        }
         data: dict[str, Any] = {}
         for field in self.LIST_FIELDS:
             col = _to_column_name(field)
-            data[col] = values.get(field, "")
-        if "name" not in data and self.LIST_FIELDS:
+            if col in columns:
+                data[col] = values.get(field, "")
+        if "name" in columns and "name" not in data and self.LIST_FIELDS:
             data["name"] = values.get(self.LIST_FIELDS[0], "")
-        data["status"] = self.STATUS_ORDER[0]
+        if "status" in columns:
+            data["status"] = self.STATUS_ORDER[0]
 
         entry_id = db.insert(table, data)
         entry = db.fetchone(f"SELECT * FROM {table} WHERE id=?", [entry_id])

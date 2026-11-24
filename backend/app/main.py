@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import db
 from app.pipeline import seed_real_data
+from app.report_data import ensure_demo_daily_report
 from app.routers import ROUTERS, PIPELINE_ROUTER
 from app.store import store
 
@@ -35,6 +36,9 @@ def startup_seed() -> None:
             print(f"[seed] 数据集初始化完成: {counts}")
         else:
             print(f"[seed] 数据集已存在，跳过初始化 (metrics={existing})")
+        demo = ensure_demo_daily_report()
+        if demo:
+            print(f"[seed] 经营日报演示数据: {demo}")
     except Exception as e:
         print(f"[seed] 初始化失败: {e}")
 

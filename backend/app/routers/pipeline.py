@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from app import report_data
 from app.database import db
 from app.pipeline import (
     check_alert, compute_aggregation, compute_cohort_comparison,
@@ -46,17 +47,160 @@ def api_run_aggregation(window_id: int) -> dict:
 
 
 @router.post("/metrics/compute-all")
-def api_compute_all_metrics() -> dict:
-    """对所有指标执行快照计算。"""
+def api_compute_all_metrics(round_id: int | None = None) -> dict:
+    """对所有指标执行快照计算（默认同轮）。"""
     svc = service_for("metric_store")
-    return svc.compute_all()
+    return svc.compute_all(round_id=round_id)
 
 
 @router.post("/metrics/{metric_id}/snapshot")
-def api_compute_snapshot(metric_id: int) -> dict:
-    """对指定指标执行快照计算。"""
+def api_compute_snapshot(metric_id: int, round_id: int | None = None) -> dict:
+    """对指定指标执行快照计算，可指定轮次。"""
     svc = service_for("metric_store")
-    return svc.compute_snapshot(metric_id)
+    return svc.compute_snapshot(metric_id, round_id=round_id)
+
+
+# ============================================================================
+# 指标轮次 / 报告数据截面
+# ============================================================================
+
+@router.post("/report-rounds")
+def api_create_round(payload: dict) -> dict:
+    """开启一轮指标计算，声明本轮应写齐的指标集合。"""
+    metric_ids = payload.get("metric_ids") or []
+    if not metric_ids and payload.get("report_id") is not None:
+        report = db.fetchone("SELECT * FROM reports WHERE id=?", [int(payload["report_id"])])
+        metric_ids = report_data.report_metric_ids(report) if report else []
+    round_row = report_data.create_round(
+        payload.get("report_id"), metric_ids,
+        note=payload.get("note", ""), round_key=payload.get("round_key"),
+    )
+    return {"ok": True, "round": round_row}
+
+
+@router.get("/report-rounds")
+def api_list_rounds(report_id: int | None = None) -> dict:
+    """列出轮次及其完成情况。"""
+    if report_id is not None:
+        rows = report_data.rounds_for_report(report_id)
+    else:
+        rows = db.fetchall("SELECT * FROM report_rounds ORDER BY id DESC")
+    items = []
+    for row in rows:
+        values = report_data.round_metric_values(int(row["id"]))
+        required = report_data._as_id_list(row.get("required_metric_ids"))
+        items.append({
+            **row,
+            "metric_ids": required,
+            "written_metric_ids": sorted(values.keys()),
+            "missing_metric_ids": [mid for mid in required if mid not in values],
+            "is_complete": report_data.round_is_complete(row, values),
+        })
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/report-rounds/{round_id}/values")
+def api_write_round_value(round_id: int, payload: dict) -> dict:
+    """把一项指标值写入指定轮次（模拟收入先落、退款后到）。"""
+    try:
+        result = report_data.write_metric_value(
+            round_id,
+            int(payload["metric_id"]),
+            float(payload["value"]),
+            baseline_value=payload.get("baseline_value"),
+            comparison_status=payload.get("comparison_status", "已保存"),
+            snapshot_time=payload.get("snapshot_time"),
+            data_source=payload.get("data_source", "report_round"),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+    return {"ok": True, "result": result}
+
+
+@router.get("/report-sections")
+def api_list_sections(report_id: int) -> dict:
+    """报告的全部数据截面（新的在前）。"""
+    return {"items": report_data.list_sections(report_id)}
+
+
+@router.get("/report-sections/{section_id}")
+def api_section_detail(section_id: int) -> dict:
+    """单个截面的完整内容与来源项。"""
+    section = report_data.section_detail(section_id)
+    if section is None:
+        return {"ok": False, "message": "截面不存在"}
+    return {"ok": True, "section": section}
+
+
+@router.post("/report/{report_id}/generate")
+def api_generate_report(
+    report_id: int,
+    round_id: int | None = None,
+    wait_for_round: bool = False,
+) -> dict:
+    """对指定报告模板执行生成（合并读取 + 固化数据截面）。"""
+    svc = service_for("data_report")
+    return svc.generate(report_id, round_id=round_id, wait_for_round=wait_for_round)
+
+
+@router.get("/report/{report_id}/outputs")
+def api_report_outputs(report_id: int, limit: int = 10) -> dict:
+    """报告历史输出，各自附带实际使用的数据截面。"""
+    items = service_for("data_report").recent_outputs(report_id, limit=limit)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/report/{report_id}/sections")
+def api_report_sections(report_id: int) -> dict:
+    """报告历次数据截面。"""
+    return {"items": report_data.list_sections(report_id)}
+
+
+@router.get("/report/{report_id}/section")
+def api_capture_report_section(report_id: int, wait_for_round: bool = False) -> dict:
+    """按当前数据合并读取一份报告截面（预览，不生成输出）。"""
+    return service_for("data_report").capture(report_id, wait_for_round=wait_for_round)
+
+
+@router.post("/report/{report_id}/snapshots")
+def api_create_report_snapshot(report_id: int, payload: dict | None = None) -> dict:
+    """把报告当前确认的数据截面整体留档（含来源项）。"""
+    payload = payload or {}
+    return service_for("report_snapshot").create_for_report(
+        report_id,
+        payload.get("snapshot_name") or f"报告{report_id}留档",
+        section_id=payload.get("section_id"),
+        wait_for_round=bool(payload.get("wait_for_round", False)),
+    )
+
+
+@router.get("/report/{report_id}/snapshots")
+def api_report_snapshots(report_id: int) -> dict:
+    """报告的全部留档，含数据截面与来源项。"""
+    items = report_data.list_snapshots(report_id)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/report-snapshots/{snapshot_id}")
+def api_snapshot_detail(snapshot_id: int) -> dict:
+    """单个留档的完整内容。"""
+    snapshot = report_data.snapshot_detail(snapshot_id)
+    if snapshot is None:
+        return {"ok": False, "message": "快照不存在"}
+    return {"ok": True, "snapshot": snapshot}
+
+
+@router.get("/report-snapshots/{snapshot_id}/comparisons")
+def api_snapshot_comparisons(snapshot_id: int) -> dict:
+    """与该留档相关的历次对比结果（不可变）。"""
+    items = report_data.list_comparisons(snapshot_id)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/report-snapshots/{snapshot_id_a}/compare/{snapshot_id_b}")
+def api_compare_snapshots(snapshot_id_a: int, snapshot_id_b: int) -> dict:
+    """按指标编号比较两个留档，逐项给出差值；同源时注明来源相同。"""
+    return report_data.compare_snapshots(snapshot_id_a, snapshot_id_b)
 
 
 @router.post("/segments/{segment_id}/compute")
@@ -101,18 +245,18 @@ def api_precompute_cube(cube_id: int) -> dict:
     return svc.run_precomputation(cube_id)
 
 
-@router.post("/report/{report_id}/generate")
-def api_generate_report(report_id: int) -> dict:
-    """对指定报告模板执行生成。"""
-    svc = service_for("data_report")
-    return svc.generate(report_id)
-
-
 @router.post("/alerts/check-all")
 def api_check_all_alerts() -> dict:
     """检查所有已生效告警规则。"""
     svc = service_for("alert_policy")
     return svc.check_all()
+
+
+@router.post("/seed/demo-report")
+def api_seed_demo_report() -> dict:
+    """准备可演示的经营日报：收入/退款 + 一轮完整数据 + 基准留档。"""
+    result = report_data.ensure_demo_daily_report()
+    return {"ok": True, "demo": result}
 
 
 @router.get("/analytics/full-pipeline")

@@ -29,6 +29,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app import report_data
 from app.database import db
 
 
@@ -204,11 +205,16 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
 # 指标计算与快照对比管道
 # ============================================================================
 
-def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
+def compute_metric_snapshot(
+    metric: dict[str, Any], round_id: int | None = None,
+) -> dict[str, Any] | None:
     """根据指标定义执行计算并生成快照。
 
     从 aggregation_results 或 events 表提取数据，按口径版本计算指标值，
     并与上一期基准值做对比，标记异常（|z-score| > 3）。
+
+    计算结果写入一个指标轮次：报告内多项指标必须同轮，后续报告读取才不会
+    出现新旧值拼接。round_id 为空时自动并入最近仍在计算且缺该指标的轮次。
     """
     metric_id = metric["id"]
     metric_name = metric["metric_name"]
@@ -216,6 +222,18 @@ def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
     cal_version = metric.get("calibration_version", 1)
 
     now_str = db.now()
+
+    # 归属轮次：同一轮内写齐报告需要的指标，报告读取时整体取用
+    if round_id is None:
+        round_row = report_data.resolve_round_for_metric(metric_id)
+        round_id = int(round_row["id"])
+    else:
+        round_row = report_data.get_round(round_id)
+        if round_row is None:
+            round_row = report_data.create_round(
+                None, [metric_id], note="按调用方轮次补建", round_key=f"RND-{round_id}",
+            )
+            round_id = int(round_row["id"])
 
     # 计算当前值
     if metric_type == "counter":
@@ -261,7 +279,15 @@ def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
         "baseline_value": baseline_value,
         "comparison_status": comparison_status,
         "z_score": z_score,
+        "round_id": round_id,
+        "round_key": round_row["round_key"] if round_row else None,
+        "data_source": "metric_store",
     })
+    round_complete = False
+    refreshed: dict[str, Any] | None = None
+    if round_row is not None:
+        refreshed = report_data.refresh_round_status(int(round_row["id"]))
+        round_complete = bool(refreshed and refreshed["status"] == report_data.ROUND_DONE)
 
     return {
         "id": insert_id,
@@ -271,6 +297,10 @@ def compute_metric_snapshot(metric: dict[str, Any]) -> dict[str, Any] | None:
         "baseline_value": baseline_value,
         "z_score": z_score,
         "comparison_status": comparison_status,
+        "round_id": round_row["id"] if round_row else None,
+        "round_key": round_row["round_key"] if round_row else None,
+        "round_status": refreshed["status"] if round_row and refreshed else None,
+        "round_complete": round_complete,
     }
 
 
@@ -851,81 +881,64 @@ def _extract_dim_values(members: list[dict[str, Any]], dim: str) -> list[float]:
 # 报告生成管道
 # ============================================================================
 
-def generate_report(report: dict[str, Any]) -> dict[str, Any]:
+def generate_report(
+    report: dict[str, Any],
+    *,
+    round_id: int | None = None,
+    wait_for_round: bool = False,
+) -> dict[str, Any]:
     """按报告模板生成数据报告。
 
-    读取关联指标的最新值，组装成结构化报告内容，写入 report_outputs 表。
-    支持 JSON 和 CSV 格式输出。
+    多指标汇总走一次合并读取，并把实际读到的数据固化成一个可回查的报告数据截面
+    （report_sections + report_section_items + report_outputs.section_id）。
+    报告内所有指标取自同一轮次；新一轮只写了一半时整体回退到上一完整轮。
     """
     report_id = report["id"]
-    metric_ids_raw = report.get("包含指标集", report.get("metric_ids", "[]"))
     output_format = report.get("输出格式", report.get("output_format", "json"))
 
-    try:
-        metric_ids = json.loads(metric_ids_raw) if isinstance(metric_ids_raw, str) else metric_ids_raw
-    except (json.JSONDecodeError, TypeError):
-        metric_ids = []
+    captured = report_data.capture_report_section(
+        report, round_id=round_id, wait_for_round=wait_for_round, note="报告生成",
+    )
+    if not captured.get("ok"):
+        return {
+            "ok": False,
+            "ready": False,
+            "message": captured.get("message", "报告数据截面生成失败"),
+            "pending_round_id": captured.get("pending_round_id"),
+            "pending_round_status": captured.get("pending_round_status"),
+        }
 
-    sections: list[dict[str, Any]] = []
-
-    if metric_ids:
-        for mid in metric_ids:
-            m = db.fetchone("SELECT * FROM metrics WHERE id=?", [mid])
-            if not m:
-                continue
-            latest = db.fetchone(
-                "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
-                [mid],
-            )
-            section = {
-                "metric_name": m["metric_name"],
-                "metric_type": m["metric_type"],
-                "unit": m["unit"],
-                "current_value": latest["snapshot_value"] if latest else None,
-                "baseline": latest["baseline_value"] if latest else None,
-                "status": latest["comparison_status"] if latest else "unknown",
-            }
-            if latest and latest.get("z_score") is not None:
-                section["z_score"] = latest["z_score"]
-            sections.append(section)
-    else:
-        # 汇总所有指标
-        all_metrics = db.fetchall("SELECT * FROM metrics LIMIT 20")
-        for m in all_metrics:
-            latest = db.fetchone(
-                "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
-                [m["id"]],
-            )
-            sections.append({
-                "metric_name": m["metric_name"],
-                "metric_type": m["metric_type"],
-                "current_value": latest["snapshot_value"] if latest else 0,
-                "status": latest["comparison_status"] if latest else "已保存",
-            })
-
-    report_content = {
-        "report_name": report.get("报告名称", report.get("report_name", "")),
-        "generated_at": db.now(),
-        "sections": sections,
-        "summary": {
-            "total_metrics": len(sections),
-            "abnormal_count": sum(1 for s in sections if s.get("status") == "有异常"),
-            "normal_count": sum(1 for s in sections if s.get("status") == "已保存"),
-        },
-    }
-
+    report_content = dict(captured["content"])
+    report_content["report_name"] = report.get("报告名称", report.get("report_name", ""))
     content_str = json.dumps(report_content, ensure_ascii=False, indent=2)
 
     output_id = db.insert("report_outputs", {
         "report_id": report_id,
         "output_content": content_str,
+        "section_id": captured["section_id"],
+        "round_id": captured["round_id"],
+        "generation_key": captured["section_key"],
     })
 
     return {
+        "ok": True,
         "id": output_id,
         "report_name": report_content["report_name"],
         "format": output_format,
         "summary": report_content["summary"],
+        "section_id": captured["section_id"],
+        "section_key": captured["section_key"],
+        "round_id": captured["round_id"],
+        "round_key": captured["round_key"],
+        "data_mode": captured["data_mode"],
+        "cutoff_at": captured["cutoff_at"],
+        "is_complete": captured["is_complete"],
+        "is_consistent": captured["is_consistent"],
+        "waited_for_round": captured["waited_for_round"],
+        "pending_round_id": captured["pending_round_id"],
+        "pending_round_status": captured["pending_round_status"],
+        "source_summary": captured["source_summary"],
+        "sections": report_content["sections"],
     }
 
 
